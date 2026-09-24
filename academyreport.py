@@ -20,37 +20,29 @@ if not TOKEN:
         "Не найдена переменная окружения DISCORD_TOKEN."
     )
 
-# ID сервера
 GUILD_ID = 1534179608390406308
 
-# Канал подачи отчётов и статистики
 REPORTS_CHANNEL_ID = 1552806315472982086
 STATS_CHANNEL_ID = 1552806315472982086
 
-# Discord ID проверяющего администратора
 REVIEWER_ID = 1416863224430596107
 
-# Роль участника мафии
 MAFIA_ROLE_NAME = "academy"
 
-# Роли, которые снимаются после 5 выговоров
 ROLES_TO_REMOVE_AFTER_FIVE = [
     "academy"
 ]
 
-# Минимум баллов за неделю
 REQUIRED_WEEKLY_POINTS = 5
-
-# Максимум выговоров
 MAX_REPRIMANDS = 5
 
-# Файл хранения данных
+# Одна стрела равна половине балла
+POINTS_PER_SHOOTOUT = 0.5
+
 DATA_FILE = "mafia_reports_data.json"
 
-# Часовой пояс Москвы
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
-# Разрешённые расширения скриншотов
 ALLOWED_IMAGE_EXTENSIONS = {
     ".png",
     ".jpg",
@@ -74,58 +66,24 @@ INTENTS.message_content = True
 # ГЛОБАЛЬНЫЕ ДАННЫЕ
 # ============================================================
 
-# Структура:
-#
-# {
-#     "users": {
-#         "USER_ID": {
-#             "total_points": 0,
-#             "reprimands": 0
-#         }
-#     },
-#     "weekly_points": {
-#         "WEEK_KEY": {
-#             "USER_ID": 5
-#         }
-#     },
-#     "reports": {
-#         "REPORT_ID": {
-#             "report_id": "...",
-#             "user_id": 123,
-#             "guild_id": 123,
-#             "week_key": "...",
-#             "requested_points": 5,
-#             "accepted_points": 0,
-#             "comment": "...",
-#             "attachment_urls": [],
-#             "status": "pending",
-#             "reviewer_id": 123,
-#             "reason": "",
-#             "created_at": "..."
-#         }
-#     },
-#     "panel_message_id": 0,
-#     "stats_message_id": 0
-# }
-#
-
 data = {
     "users": {},
     "weekly_points": {},
     "reports": {},
     "panel_message_id": None,
-    "stats_message_id": None
+    "stats_message_id": None,
+    "last_processed_week": None
 }
 
 data_loaded = False
 
 
 # ============================================================
-# БЕЗОПАСНЫЕ ДАННЫЕ
+# СОХРАНЕНИЕ И ЗАГРУЗКА
 # ============================================================
 
 def save_data():
-    """Сохраняет все данные в JSON-файл."""
+    """Сохраняет данные в JSON-файл."""
     try:
         with open(DATA_FILE, "w", encoding="utf-8") as file:
             json.dump(
@@ -153,7 +111,7 @@ def load_data():
 
         if not isinstance(loaded_data, dict):
             raise ValueError(
-                "Корневой объект JSON должен быть словарём."
+                "Корень JSON должен быть объектом."
             )
 
         data = {
@@ -174,6 +132,9 @@ def load_data():
             ),
             "stats_message_id": loaded_data.get(
                 "stats_message_id"
+            ),
+            "last_processed_week": loaded_data.get(
+                "last_processed_week"
             )
         }
 
@@ -193,10 +154,14 @@ def load_data():
             "Будет создан новый."
         )
 
-    except (json.JSONDecodeError, ValueError) as error:
+    except json.JSONDecodeError as error:
         print(
-            f"❌ Ошибка структуры файла данных: "
-            f"{error}"
+            f"❌ Ошибка JSON-файла: {error}"
+        )
+
+    except ValueError as error:
+        print(
+            f"❌ Ошибка структуры данных: {error}"
         )
 
     except OSError as error:
@@ -206,44 +171,131 @@ def load_data():
 
 
 def ensure_user_data(user_id: int):
-    """Создаёт запись пользователя, если её нет."""
-    user_id = str(user_id)
+    """Создаёт профиль пользователя, если его нет."""
+    user_key = str(user_id)
 
-    if user_id not in data["users"]:
-        data["users"][user_id] = {
-            "total_points": 0,
+    if user_key not in data["users"]:
+        data["users"][user_key] = {
+            "total_points": 0.0,
             "reprimands": 0
         }
 
-    return data["users"][user_id]
+    user_data = data["users"][user_key]
+
+    if "total_points" not in user_data:
+        user_data["total_points"] = 0.0
+
+    if "reprimands" not in user_data:
+        user_data["reprimands"] = 0
+
+    return user_data
 
 
 # ============================================================
-# ВРЕМЯ И НЕДЕЛИ
+# РАБОТА С БАЛЛАМИ
+# ============================================================
+
+def format_points(points: float) -> str:
+    """Красиво отображает целые и дробные баллы."""
+    points = float(points)
+
+    if points.is_integer():
+        return str(int(points))
+
+    return f"{points:.1f}"
+
+
+def shoots_to_points(shoots: int) -> float:
+    """Переводит количество стрел в баллы."""
+    return shoots * POINTS_PER_SHOOTOUT
+
+
+def get_weekly_points(
+    user_id: int,
+    week_key: str | None = None
+) -> float:
+    """Возвращает баллы пользователя за неделю."""
+    if week_key is None:
+        week_key = get_week_key()
+
+    week_data = data["weekly_points"].get(
+        week_key,
+        {}
+    )
+
+    return float(
+        week_data.get(
+            str(user_id),
+            0
+        )
+    )
+
+
+def add_weekly_points(
+    user_id: int,
+    points: float,
+    week_key: str | None = None
+):
+    """Добавляет баллы за неделю и в общую статистику."""
+    if week_key is None:
+        week_key = get_week_key()
+
+    if week_key not in data["weekly_points"]:
+        data["weekly_points"][week_key] = {}
+
+    user_key = str(user_id)
+
+    old_weekly_points = float(
+        data["weekly_points"][week_key].get(
+            user_key,
+            0
+        )
+    )
+
+    data["weekly_points"][week_key][user_key] = (
+        old_weekly_points + points
+    )
+
+    user_data = ensure_user_data(
+        user_id
+    )
+
+    user_data["total_points"] = float(
+        user_data.get(
+            "total_points",
+            0
+        )
+    ) + points
+
+
+# ============================================================
+# ВРЕМЯ И ОТЧЁТНЫЕ НЕДЕЛИ
 # ============================================================
 
 def now_moscow() -> datetime:
-    """Возвращает текущее время Москвы."""
+    """Возвращает текущее время по Москве."""
     return datetime.now(MOSCOW_TZ)
 
 
-def get_week_key(moment: datetime | None = None) -> str:
+def get_week_key(
+    moment: datetime | None = None
+) -> str:
     """
-    Возвращает ключ текущей отчётной недели.
+    Возвращает ключ отчётной недели.
 
-    Неделя начинается в понедельник
-    и заканчивается в воскресенье 23:59.
+    Неделя:
+    понедельник 00:00 —
+    воскресенье 23:59 по Москве.
     """
     if moment is None:
         moment = now_moscow()
 
     moment = moment.astimezone(MOSCOW_TZ)
 
-    monday = moment - timedelta(
-        days=moment.weekday()
-    )
-
-    monday = monday.replace(
+    monday = (
+        moment
+        - timedelta(days=moment.weekday())
+    ).replace(
         hour=0,
         minute=0,
         second=0,
@@ -261,7 +313,7 @@ def get_week_key(moment: datetime | None = None) -> str:
 def get_week_dates(
     week_key: str | None = None
 ):
-    """Возвращает дату начала и окончания недели."""
+    """Возвращает начало и конец недели."""
     if week_key is None:
         week_key = get_week_key()
 
@@ -316,7 +368,7 @@ def get_week_dates(
 def get_week_display(
     week_key: str | None = None
 ) -> str:
-    """Красивое отображение недели."""
+    """Красивое отображение отчётной недели."""
     monday, sunday = get_week_dates(
         week_key
     )
@@ -327,69 +379,36 @@ def get_week_display(
     )
 
 
-def get_weekly_points(
-    user_id: int,
-    week_key: str | None = None
-) -> int:
-    """Возвращает баллы пользователя за неделю."""
-    if week_key is None:
-        week_key = get_week_key()
-
-    week_data = data["weekly_points"].get(
-        week_key,
-        {}
-    )
-
-    return int(
-        week_data.get(
-            str(user_id),
-            0
+def get_previous_week_key() -> str:
+    """Возвращает ключ завершившейся недели."""
+    current_monday = (
+        now_moscow()
+        - timedelta(
+            days=now_moscow().weekday()
         )
+    ).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0
     )
 
-
-def add_weekly_points(
-    user_id: int,
-    points: int,
-    week_key: str | None = None
-):
-    """Добавляет баллы пользователю за неделю."""
-    if week_key is None:
-        week_key = get_week_key()
-
-    if week_key not in data["weekly_points"]:
-        data["weekly_points"][week_key] = {}
-
-    user_key = str(user_id)
-
-    current_points = int(
-        data["weekly_points"][week_key].get(
-            user_key,
-            0
-        )
+    previous_sunday = current_monday - timedelta(
+        days=1
     )
 
-    data["weekly_points"][week_key][user_key] = (
-        current_points + points
+    return get_week_key(
+        previous_sunday
     )
-
-    user_data = ensure_user_data(
-        user_id
-    )
-
-    user_data["total_points"] = int(
-        user_data.get(
-            "total_points",
-            0
-        )
-    ) + points
 
 
 # ============================================================
 # РОЛИ
 # ============================================================
 
-def has_mafia_role(member: discord.Member) -> bool:
+def has_mafia_role(
+    member: discord.Member
+) -> bool:
     """Проверяет наличие роли academy."""
     target_name = MAFIA_ROLE_NAME.lower()
 
@@ -417,7 +436,7 @@ async def remove_mafia_roles(
     member: discord.Member,
     reason: str
 ):
-    """Снимает роли, указанные после 5 выговоров."""
+    """Снимает роли после пяти выговоров."""
     roles_to_remove = []
 
     for role_name in ROLES_TO_REMOVE_AFTER_FIVE:
@@ -436,6 +455,20 @@ async def remove_mafia_roles(
         )
         return
 
+    if member.guild.me is None:
+        print(
+            "❌ Не удалось определить бота на сервере."
+        )
+        return
+
+    for role in roles_to_remove:
+        if role >= member.guild.me.top_role:
+            print(
+                f"❌ Роль {role.name} находится "
+                "выше роли бота."
+            )
+            return
+
     try:
         await member.remove_roles(
             *roles_to_remove,
@@ -450,24 +483,23 @@ async def remove_mafia_roles(
     except discord.Forbidden:
         print(
             f"❌ Бот не может снять роли у {member}. "
-            f"Проверь Manage Roles и иерархию."
+            "Проверь Manage Roles."
         )
 
     except discord.HTTPException as error:
         print(
-            f"❌ Ошибка снятия ролей у {member}: "
-            f"{error}"
+            f"❌ Ошибка снятия ролей: {error}"
         )
 
 
 # ============================================================
-# ВЛОЖЕНИЯ И ОТЧЁТЫ
+# ОТЧЁТЫ
 # ============================================================
 
 def is_allowed_image(
     attachment: discord.Attachment
 ) -> bool:
-    """Проверяет расширение изображения."""
+    """Проверяет, является ли вложение изображением."""
     filename = attachment.filename.lower()
 
     return any(
@@ -490,7 +522,7 @@ def get_pending_report_for_user(
     user_id: int,
     week_key: str | None = None
 ):
-    """Ищет ожидающий отчёт пользователя."""
+    """Ищет отчёт пользователя на проверке."""
     if week_key is None:
         week_key = get_week_key()
 
@@ -509,7 +541,7 @@ def has_accepted_report_for_week(
     user_id: int,
     week_key: str | None = None
 ) -> bool:
-    """Проверяет, был ли уже принятый отчёт."""
+    """Проверяет, есть ли уже принятый отчёт."""
     if week_key is None:
         week_key = get_week_key()
 
@@ -532,7 +564,7 @@ def create_report_embed(
     report: dict,
     member: discord.Member | None = None
 ) -> discord.Embed:
-    """Создаёт Embed для отчёта."""
+    """Создаёт Embed заявки."""
     status = report.get(
         "status",
         "pending"
@@ -559,19 +591,56 @@ def create_report_embed(
             f"ID: `{report['user_id']}`"
         )
 
+    report_user_id = int(
+        report["user_id"]
+    )
+
+    report_week_key = report.get(
+        "week_key"
+    )
+
+    weekly_points = get_weekly_points(
+        report_user_id,
+        report_week_key
+    )
+
+    user_data = ensure_user_data(
+        report_user_id
+    )
+
+    reprimands = int(
+        user_data.get(
+            "reprimands",
+            0
+        )
+    )
+
+    requested_shoots = int(
+        report.get(
+            "requested_shoots",
+            0
+        )
+    )
+
+    calculated_points = shoots_to_points(
+        requested_shoots
+    )
+
+    status_color = discord.Color.orange()
+
+    if status == "accepted":
+        status_color = discord.Color.green()
+
+    elif status == "rejected":
+        status_color = discord.Color.red()
+
     embed = discord.Embed(
         title="📨 Недельный отчёт",
         description=(
             "Проверьте скриншоты и решите, "
             "засчитать ли баллы."
         ),
-        color=discord.Color.orange()
-        if status == "pending"
-        else (
-            discord.Color.green()
-            if status == "accepted"
-            else discord.Color.red()
-        )
+        color=status_color
     )
 
     embed.add_field(
@@ -583,18 +652,25 @@ def create_report_embed(
     embed.add_field(
         name="📅 Отчётная неделя",
         value=get_week_display(
-            report.get("week_key")
+            report_week_key
         ),
         inline=True
     )
 
     embed.add_field(
-        name="🎯 Заявлено баллов",
+        name="🎯 Заявлено стрел",
         value=str(
-            report.get(
-                "requested_points",
-                0
-            )
+            requested_shoots
+        ),
+        inline=True
+    )
+
+    embed.add_field(
+        name="💰 По расчёту",
+        value=(
+            f"{requested_shoots} × "
+            f"{format_points(POINTS_PER_SHOOTOUT)} "
+            f"= **{format_points(calculated_points)} балла**"
         ),
         inline=True
     )
@@ -602,23 +678,17 @@ def create_report_embed(
     embed.add_field(
         name="📊 Баллы за неделю",
         value=(
-            f"{get_weekly_points("
-                f"int(report['user_id']), "
-                f"report.get('week_key')"
-            )}/{REQUIRED_WEEKLY_POINTS}"
+            f"{format_points(weekly_points)}/"
+            f"{format_points(REQUIRED_WEEKLY_POINTS)}"
         ),
         inline=True
-    )
-
-    user_data = ensure_user_data(
-        int(report["user_id"])
     )
 
     embed.add_field(
         name="⚠️ Выговоры",
         value=(
-            f"{user_data.get('reprimands', 0)}"
-            f"/{MAX_REPRIMANDS}"
+            f"{reprimands}/"
+            f"{MAX_REPRIMANDS}"
         ),
         inline=True
     )
@@ -629,22 +699,28 @@ def create_report_embed(
         inline=True
     )
 
-    comment = report.get(
-        "comment",
-        ""
+    comment = str(
+        report.get(
+            "comment",
+            ""
+        )
     ).strip()
 
     embed.add_field(
-        name="💬 Комментарий участника",
-        value=comment[:1024]
-        if comment
-        else "Не указан",
+        name="💬 Комментарий",
+        value=(
+            comment[:1024]
+            if comment
+            else "Не указан"
+        ),
         inline=False
     )
 
-    reason = report.get(
-        "reason",
-        ""
+    reason = str(
+        report.get(
+            "reason",
+            ""
+        )
     ).strip()
 
     if reason:
@@ -656,7 +732,8 @@ def create_report_embed(
 
     embed.set_footer(
         text=(
-            f"ID отчёта: {report.get('report_id')}"
+            f"ID отчёта: "
+            f"{report.get('report_id')}"
         )
     )
 
@@ -670,7 +747,7 @@ def create_report_embed(
 def create_statistics_embed(
     guild: discord.Guild
 ) -> discord.Embed:
-    """Создаёт Embed с общей статистикой."""
+    """Создаёт таблицу статистики."""
     week_key = get_week_key()
 
     embed = discord.Embed(
@@ -678,8 +755,12 @@ def create_statistics_embed(
         description=(
             f"Текущая неделя: "
             f"**{get_week_display(week_key)}**\n"
-            f"Необходимый минимум: "
-            f"**{REQUIRED_WEEKLY_POINTS} баллов**"
+            f"Минимум: "
+            f"**{format_points(REQUIRED_WEEKLY_POINTS)} "
+            f"баллов**\n"
+            f"Расчёт: "
+            f"**1 стрела = "
+            f"{format_points(POINTS_PER_SHOOTOUT)} балла**"
         ),
         color=discord.Color.blurple(),
         timestamp=now_moscow()
@@ -698,7 +779,7 @@ def create_statistics_embed(
         embed.add_field(
             name="👥 Участники",
             value=(
-                "Участники с ролью "
+                f"Участники с ролью "
                 f"`{MAFIA_ROLE_NAME}` не найдены."
             ),
             inline=False
@@ -729,7 +810,7 @@ def create_statistics_embed(
             week_key
         )
 
-        total_points = int(
+        total_points = float(
             user_data.get(
                 "total_points",
                 0
@@ -745,6 +826,7 @@ def create_statistics_embed(
 
         if weekly_points >= REQUIRED_WEEKLY_POINTS:
             status = "✅"
+
         else:
             status = "⏳"
 
@@ -754,26 +836,33 @@ def create_statistics_embed(
         lines.append(
             f"**{index}.** {member.mention}\n"
             f"└ {status} Неделя: "
-            f"**{weekly_points}/{REQUIRED_WEEKLY_POINTS}** "
-            f"· Всего: **{total_points}** "
-            f"· В/г: **{reprimands}/{MAX_REPRIMANDS}**"
+            f"**{format_points(weekly_points)}/"
+            f"{format_points(REQUIRED_WEEKLY_POINTS)}** "
+            f"· Всего: **{format_points(total_points)}** "
+            f"· В/г: **{reprimands}/"
+            f"{MAX_REPRIMANDS}**"
         )
 
-    # Discord ограничивает размер поля
     chunks = []
     current_chunk = ""
 
     for line in lines:
         if len(current_chunk) + len(line) + 2 > 1000:
-            chunks.append(current_chunk)
+            chunks.append(
+                current_chunk
+            )
             current_chunk = ""
 
         current_chunk += line + "\n\n"
 
     if current_chunk:
-        chunks.append(current_chunk)
+        chunks.append(
+            current_chunk
+        )
 
-    for index, chunk in enumerate(chunks):
+    for index, chunk in enumerate(
+        chunks
+    ):
         field_name = (
             "👥 Участники"
             if index == 0
@@ -788,7 +877,7 @@ def create_statistics_embed(
 
     embed.set_footer(
         text=(
-            "Баллы и выговоры обновляются автоматически"
+            "Таблица обновляется автоматически"
         )
     )
 
@@ -796,12 +885,10 @@ def create_statistics_embed(
 
 
 # ============================================================
-# КОМПОНЕНТЫ ЗАЯВКИ
+# MODAL ОТПРАВКИ ОТЧЁТА
 # ============================================================
 
 class ReportModal(ui.Modal):
-    """Форма отправки отчёта."""
-
     def __init__(
         self,
         member: discord.Member
@@ -812,18 +899,18 @@ class ReportModal(ui.Modal):
 
         self.member = member
 
-        self.points_input = ui.TextInput(
-            label="Количество заявленных баллов",
-            placeholder="Например: 5",
+        self.shoots_input = ui.TextInput(
+            label="Количество стрел",
+            placeholder="Например: 10",
             min_length=1,
-            max_length=3,
+            max_length=4,
             required=True
         )
 
         self.comment_input = ui.TextInput(
             label="Комментарий к отчёту",
             placeholder=(
-                "Кратко опишите, за что получены баллы"
+                "Напишите, за что получены стрелы"
             ),
             style=discord.TextStyle.paragraph,
             max_length=1000,
@@ -831,7 +918,7 @@ class ReportModal(ui.Modal):
         )
 
         self.add_item(
-            self.points_input
+            self.shoots_input
         )
 
         self.add_item(
@@ -853,33 +940,36 @@ class ReportModal(ui.Modal):
 
         if not has_mafia_role(self.member):
             await interaction.response.send_message(
-                f"❌ У вас нет роли `{MAFIA_ROLE_NAME}`.",
+                f"❌ У вас нет роли "
+                f"`{MAFIA_ROLE_NAME}`.",
                 ephemeral=True
             )
             return
 
         try:
-            requested_points = int(
-                str(self.points_input.value).strip()
+            requested_shoots = int(
+                str(
+                    self.shoots_input.value
+                ).strip()
             )
 
         except ValueError:
             await interaction.response.send_message(
-                "❌ Количество баллов должно быть числом.",
+                "❌ Количество стрел должно быть числом.",
                 ephemeral=True
             )
             return
 
-        if requested_points <= 0:
+        if requested_shoots <= 0:
             await interaction.response.send_message(
-                "❌ Количество баллов должно быть больше нуля.",
+                "❌ Количество стрел должно быть больше нуля.",
                 ephemeral=True
             )
             return
 
-        if requested_points > 100:
+        if requested_shoots > 1000:
             await interaction.response.send_message(
-                "❌ Нельзя указать больше 100 баллов.",
+                "❌ Нельзя указать больше 1000 стрел.",
                 ephemeral=True
             )
             return
@@ -901,8 +991,7 @@ class ReportModal(ui.Modal):
             week_key
         ):
             await interaction.response.send_message(
-                "❌ За эту неделю у вас уже есть "
-                "принятый отчёт.",
+                "❌ За эту неделю отчёт уже принят.",
                 ephemeral=True
             )
             return
@@ -911,10 +1000,10 @@ class ReportModal(ui.Modal):
             (
                 "📎 Теперь отправьте в этот канал "
                 "сообщение со скриншотами отчёта.\n\n"
+                f"Заявлено стрел: **{requested_shoots}**\n"
+                f"Расчёт: **{format_points(shoots_to_points(requested_shoots))} балла**\n\n"
                 "В одном сообщении можно прикрепить "
-                "несколько изображений.\n"
-                "Это сообщение должно быть отправлено "
-                "в течение 10 минут."
+                "несколько изображений."
             ),
             ephemeral=True
         )
@@ -934,9 +1023,13 @@ class ReportModal(ui.Modal):
         except asyncio.TimeoutError:
             try:
                 await self.member.send(
-                    "⌛ Время ожидания скриншотов истекло. "
-                    "Отчёт не был создан."
+                    (
+                        "⌛ Время ожидания скриншотов "
+                        "истекло.\n"
+                        "Отчёт не был создан."
+                    )
                 )
+
             except discord.Forbidden:
                 pass
 
@@ -949,22 +1042,34 @@ class ReportModal(ui.Modal):
         ]
 
         if not image_attachments:
-            await self.member.send(
-                "❌ Отчёт не принят: "
-                "сообщение не содержит изображений."
-            )
+            try:
+                await self.member.send(
+                    (
+                        "❌ Отчёт не принят.\n"
+                        "В сообщении не найдено "
+                        "изображений."
+                    )
+                )
+
+            except discord.Forbidden:
+                pass
 
             return
 
         report_id = get_report_id()
+
+        calculated_points = shoots_to_points(
+            requested_shoots
+        )
 
         report = {
             "report_id": report_id,
             "user_id": self.member.id,
             "guild_id": guild.id,
             "week_key": week_key,
-            "requested_points": requested_points,
-            "accepted_points": 0,
+            "requested_shoots": requested_shoots,
+            "calculated_points": calculated_points,
+            "accepted_points": 0.0,
             "comment": str(
                 self.comment_input.value
             ).strip(),
@@ -983,7 +1088,9 @@ class ReportModal(ui.Modal):
 
         save_data()
 
-        reviewer = bot.get_user(REVIEWER_ID)
+        reviewer = bot.get_user(
+            REVIEWER_ID
+        )
 
         if reviewer is None:
             try:
@@ -995,8 +1102,10 @@ class ReportModal(ui.Modal):
 
         if reviewer is None:
             await interaction.followup.send(
-                "⚠️ Отчёт сохранён, но проверяющий "
-                "администратор не найден.",
+                (
+                    "⚠️ Отчёт сохранён, но "
+                    "проверяющий не найден."
+                ),
                 ephemeral=True
             )
             return
@@ -1028,14 +1137,21 @@ class ReportModal(ui.Modal):
                 except discord.HTTPException:
                     pass
 
-            await self.member.send(
-                (
-                    "✅ Ваш отчёт отправлен "
-                    "на проверку.\n"
-                    f"Заявлено баллов: **{requested_points}**\n"
-                    f"Неделя: **{get_week_display(week_key)}**"
+            try:
+                await self.member.send(
+                    (
+                        "✅ Ваш отчёт отправлен "
+                        "на проверку.\n\n"
+                        f"Стрел: **{requested_shoots}**\n"
+                        f"Баллов по расчёту: **"
+                        f"{format_points(calculated_points)}**\n"
+                        f"Неделя: **"
+                        f"{get_week_display(week_key)}**"
+                    )
                 )
-            )
+
+            except discord.Forbidden:
+                pass
 
             await update_statistics_message()
 
@@ -1044,7 +1160,8 @@ class ReportModal(ui.Modal):
                 (
                     "❌ Не удалось отправить отчёт "
                     "проверяющему в личные сообщения.\n"
-                    "Проверьте, что личные сообщения открыты."
+                    "Откройте личные сообщения "
+                    "для сервера."
                 ),
                 ephemeral=True
             )
@@ -1055,9 +1172,11 @@ class ReportModal(ui.Modal):
             )
 
 
-class SubmitReportView(ui.View):
-    """Постоянная кнопка подачи отчёта."""
+# ============================================================
+# ПАНЕЛЬ УЧАСТНИКА
+# ============================================================
 
+class SubmitReportView(ui.View):
     def __init__(self):
         super().__init__(
             timeout=None
@@ -1138,7 +1257,7 @@ class SubmitReportView(ui.View):
             member.id
         )
 
-        total_points = int(
+        total_points = float(
             user_data.get(
                 "total_points",
                 0
@@ -1160,15 +1279,26 @@ class SubmitReportView(ui.View):
         embed.add_field(
             name="📅 Текущая неделя",
             value=(
-                f"{weekly_points}/"
-                f"{REQUIRED_WEEKLY_POINTS} баллов"
+                f"{format_points(weekly_points)}/"
+                f"{format_points(REQUIRED_WEEKLY_POINTS)}"
+                " баллов"
+            ),
+            inline=False
+        )
+
+        embed.add_field(
+            name="🎯 Стрелы",
+            value=(
+                f"1 стрела = "
+                f"{format_points(POINTS_PER_SHOOTOUT)} "
+                "балла"
             ),
             inline=False
         )
 
         embed.add_field(
             name="🏆 Всего баллов",
-            value=str(total_points),
+            value=format_points(total_points),
             inline=True
         )
 
@@ -1188,12 +1318,10 @@ class SubmitReportView(ui.View):
 
 
 # ============================================================
-# ПРОВЕРКА ОТЧЁТА АДМИНИСТРАТОРОМ
+# ПРОВЕРКА ОТЧЁТА
 # ============================================================
 
 class ReportReviewView(ui.View):
-    """Кнопки принятия или отказа в баллах."""
-
     def __init__(
         self,
         report_id: str
@@ -1241,11 +1369,15 @@ class ReportReviewView(ui.View):
             )
             return
 
-        points = int(
+        requested_shoots = int(
             report.get(
-                "requested_points",
+                "requested_shoots",
                 0
             )
+        )
+
+        points = shoots_to_points(
+            requested_shoots
         )
 
         report["status"] = "accepted"
@@ -1263,10 +1395,11 @@ class ReportReviewView(ui.View):
 
         save_data()
 
-        member = None
         guild = bot.get_guild(
             int(report["guild_id"])
         )
+
+        member = None
 
         if guild:
             member = guild.get_member(
@@ -1279,9 +1412,9 @@ class ReportReviewView(ui.View):
         )
 
         result_embed.add_field(
-            name="✅ Результат",
+            name="✅ Начислено",
             value=(
-                f"Начислено баллов: **{points}**"
+                f"{format_points(points)} балла"
             ),
             inline=False
         )
@@ -1301,21 +1434,28 @@ class ReportReviewView(ui.View):
                     int(report["user_id"])
                 )
 
+            current_weekly_points = (
+                get_weekly_points(
+                    int(report["user_id"]),
+                    report["week_key"]
+                )
+            )
+
             await user.send(
                 (
                     "✅ Ваш отчёт принят.\n\n"
-                    f"Вам начислено баллов: **{points}**\n"
-                    f"За текущую неделю: "
-                    f"**{get_weekly_points("
-                        f"int(report['user_id']), "
-                        f"report['week_key']"
-                    )}/{REQUIRED_WEEKLY_POINTS}**"
+                    f"Стрел: **{requested_shoots}**\n"
+                    f"Начислено баллов: **"
+                    f"{format_points(points)}**\n"
+                    f"За неделю: **"
+                    f"{format_points(current_weekly_points)}/"
+                    f"{format_points(REQUIRED_WEEKLY_POINTS)}**"
                 )
             )
 
         except discord.Forbidden:
             print(
-                "⚠️ Не удалось отправить результат "
+                "⚠️ Нельзя отправить результат "
                 "игроку в ЛС."
             )
 
@@ -1372,8 +1512,6 @@ class ReportReviewView(ui.View):
 
 
 class RejectReportModal(ui.Modal):
-    """Окно для ввода причины отказа."""
-
     def __init__(
         self,
         report_id: str
@@ -1388,7 +1526,7 @@ class RejectReportModal(ui.Modal):
             label="Причина отказа",
             placeholder=(
                 "Например: на скриншоте "
-                "не видно дату или результат"
+                "не видно дату"
             ),
             style=discord.TextStyle.paragraph,
             min_length=3,
@@ -1406,7 +1544,7 @@ class RejectReportModal(ui.Modal):
     ):
         if interaction.user.id != REVIEWER_ID:
             await interaction.response.send_message(
-                "❌ У вас нет доступа к проверке.",
+                "❌ У вас нет доступа.",
                 ephemeral=True
             )
             return
@@ -1442,10 +1580,11 @@ class RejectReportModal(ui.Modal):
 
         save_data()
 
-        member = None
         guild = bot.get_guild(
             int(report["guild_id"])
         )
+
+        member = None
 
         if guild:
             member = guild.get_member(
@@ -1481,8 +1620,8 @@ class RejectReportModal(ui.Modal):
 
         except discord.Forbidden:
             print(
-                "⚠️ Не удалось отправить причину "
-                "отказа игроку в ЛС."
+                "⚠️ Нельзя отправить отказ "
+                "игроку в ЛС."
             )
 
         except discord.HTTPException as error:
@@ -1499,22 +1638,26 @@ class RejectReportModal(ui.Modal):
 # ============================================================
 
 def create_panel_embed() -> discord.Embed:
-    """Создаёт панель подачи отчёта."""
+    """Создаёт панель подачи отчётов."""
     embed = discord.Embed(
         title="📨 Еженедельные отчёты мафии",
         description=(
             "Каждую неделю участники мафии должны "
             "набрать минимум **5 баллов**.\n\n"
+            "**Расчёт баллов:**\n"
+            "🎯 **1 стрела = 0.5 балла**\n"
+            "🎯 **2 стрелы = 1 балл**\n"
+            "🎯 **10 стрел = 5 баллов**\n\n"
             "**Как подать отчёт:**\n"
-            "1. Нажмите кнопку `📨 Подать отчёт`.\n"
-            "2. Укажите количество заявленных баллов.\n"
+            "1. Нажмите `📨 Подать отчёт`.\n"
+            "2. Укажите количество стрел.\n"
             "3. Напишите комментарий.\n"
-            "4. Отправьте сообщение со скриншотами "
-            "в этот канал.\n"
+            "4. Отправьте скриншоты в этот канал.\n"
             "5. Дождитесь проверки администратора.\n\n"
-            "Если за неделю набрано меньше 5 баллов, "
-            "участник получает один выговор.\n"
-            "После получения 5 выговоров роль "
+            "Если за неделю набрано меньше "
+            "**5 баллов**, участник получает "
+            "один выговор.\n"
+            "После **5 выговоров** роль "
             "`academy` снимается."
         ),
         color=discord.Color.from_rgb(
@@ -1544,8 +1687,7 @@ def create_panel_embed() -> discord.Embed:
 
     embed.set_footer(
         text=(
-            "Отчёты проверяются администратором "
-            "вручную"
+            "Отчёты проверяются администратором вручную"
         )
     )
 
@@ -1557,7 +1699,7 @@ def create_panel_embed() -> discord.Embed:
 # ============================================================
 
 async def ensure_panel_exists():
-    """Проверяет и восстанавливает панель."""
+    """Проверяет и восстанавливает панель отчётов."""
     channel = bot.get_channel(
         REPORTS_CHANNEL_ID
     )
@@ -1576,10 +1718,14 @@ async def ensure_panel_exists():
 
     embed = create_panel_embed()
 
-    if data.get("panel_message_id"):
+    saved_message_id = data.get(
+        "panel_message_id"
+    )
+
+    if saved_message_id:
         try:
             message = await channel.fetch_message(
-                int(data["panel_message_id"])
+                int(saved_message_id)
             )
 
             await message.edit(
@@ -1591,12 +1737,12 @@ async def ensure_panel_exists():
 
         except discord.NotFound:
             print(
-                "⚠️ Панель отчётов удалена."
+                "⚠️ Старая панель была удалена."
             )
 
         except discord.Forbidden:
             print(
-                "❌ Нет доступа к панели отчётов."
+                "❌ Нет доступа к старой панели."
             )
             return
 
@@ -1615,9 +1761,9 @@ async def ensure_panel_exists():
             if not message.embeds:
                 continue
 
-            title = message.embeds[0].title
-
-            if title == "📨 Еженедельные отчёты мафии":
+            if message.embeds[0].title == (
+                "📨 Еженедельные отчёты мафии"
+            ):
                 data["panel_message_id"] = message.id
 
                 await message.edit(
@@ -1628,7 +1774,7 @@ async def ensure_panel_exists():
                 save_data()
 
                 print(
-                    "✅ Найдена старая панель отчётов."
+                    "✅ Найдена старая панель."
                 )
 
                 return
@@ -1656,7 +1802,7 @@ async def ensure_panel_exists():
         save_data()
 
         print(
-            f"✅ Создана новая панель отчётов: "
+            f"✅ Создана новая панель: "
             f"{message.id}"
         )
 
@@ -1672,18 +1818,18 @@ async def ensure_panel_exists():
 
 
 # ============================================================
-# ПОДДЕРЖАНИЕ СООБЩЕНИЯ СТАТИСТИКИ
+# ПОДДЕРЖАНИЕ СТАТИСТИКИ
 # ============================================================
 
 async def update_statistics_message():
-    """Обновляет статистику в канале."""
+    """Создаёт или обновляет сообщение статистики."""
     guild = bot.get_guild(
         GUILD_ID
     )
 
     if guild is None:
         print(
-            "❌ Сервер статистики не найден."
+            "❌ Сервер не найден."
         )
         return
 
@@ -1704,11 +1850,15 @@ async def update_statistics_message():
         guild
     )
 
+    saved_message_id = data.get(
+        "stats_message_id"
+    )
+
     try:
-        if data.get("stats_message_id"):
+        if saved_message_id:
             try:
                 message = await channel.fetch_message(
-                    int(data["stats_message_id"])
+                    int(saved_message_id)
                 )
 
                 await message.edit(
@@ -1719,7 +1869,8 @@ async def update_statistics_message():
 
             except discord.NotFound:
                 print(
-                    "⚠️ Сообщение статистики удалено."
+                    "⚠️ Старое сообщение статистики "
+                    "удалено."
                 )
 
         async for message in channel.history(
@@ -1731,9 +1882,9 @@ async def update_statistics_message():
             if not message.embeds:
                 continue
 
-            title = message.embeds[0].title
-
-            if title == "📊 Статистика еженедельных отчётов":
+            if message.embeds[0].title == (
+                "📊 Статистика еженедельных отчётов"
+            ):
                 data["stats_message_id"] = message.id
 
                 await message.edit(
@@ -1769,36 +1920,15 @@ async def update_statistics_message():
 
 
 # ============================================================
-# ЕЖЕНЕДЕЛЬНАЯ ПРОВЕРКА
+# НЕДЕЛЬНАЯ ПРОВЕРКА
 # ============================================================
-
-def get_previous_week_key() -> str:
-    """Возвращает ключ завершившейся недели."""
-    current_week_start = (
-        now_moscow()
-        - timedelta(
-            days=now_moscow().weekday()
-        )
-    ).replace(
-        hour=0,
-        minute=0,
-        second=0,
-        microsecond=0
-    )
-
-    previous_week = current_week_start - timedelta(
-        days=1
-    )
-
-    return get_week_key(
-        previous_week
-    )
-
 
 async def process_previous_week():
     """
-    Выдаёт выговоры участникам,
-    которые не набрали минимум.
+    Проверяет завершившуюся неделю.
+
+    Если участник набрал меньше 5 баллов,
+    ему добавляется один выговор.
     """
     guild = bot.get_guild(
         GUILD_ID
@@ -1806,32 +1936,30 @@ async def process_previous_week():
 
     if guild is None:
         print(
-            "❌ Сервер для недельной проверки не найден."
+            "❌ Сервер для проверки не найден."
         )
         return
 
     previous_week_key = get_previous_week_key()
 
-    processed_key = data.get(
-        "last_processed_week"
-    )
-
-    if processed_key == previous_week_key:
+    if data.get("last_processed_week") == (
+        previous_week_key
+    ):
         return
 
     print(
-        f"📅 Проверка завершённой недели: "
+        f"📅 Проверка недели: "
         f"{get_week_display(previous_week_key)}"
     )
 
-    mafia_members = [
+    members = [
         member
         for member in guild.members
         if not member.bot
         and has_mafia_role(member)
     ]
 
-    for member in mafia_members:
+    for member in members:
         weekly_points = get_weekly_points(
             member.id,
             previous_week_key
@@ -1851,9 +1979,7 @@ async def process_previous_week():
             )
         ) + 1
 
-        current_reprimands = user_data[
-            "reprimands"
-        ]
+        reprimands = user_data["reprimands"]
 
         try:
             await member.send(
@@ -1863,10 +1989,10 @@ async def process_previous_week():
                     f"Неделя: "
                     f"**{get_week_display(previous_week_key)}**\n"
                     f"Ваш результат: "
-                    f"**{weekly_points}/"
-                    f"{REQUIRED_WEEKLY_POINTS}** баллов\n"
+                    f"**{format_points(weekly_points)}/"
+                    f"{format_points(REQUIRED_WEEKLY_POINTS)}**\n"
                     f"Выговоры: "
-                    f"**{current_reprimands}/"
+                    f"**{reprimands}/"
                     f"{MAX_REPRIMANDS}**"
                 )
             )
@@ -1877,11 +2003,13 @@ async def process_previous_week():
                 f"{member} в ЛС."
             )
 
-        if current_reprimands >= MAX_REPRIMANDS:
+        if reprimands >= MAX_REPRIMANDS:
             await remove_mafia_roles(
                 member,
-                "Получено 5 выговоров "
-                "за недельные отчёты"
+                (
+                    "Получено 5 выговоров "
+                    "за недельные отчёты"
+                )
             )
 
             try:
@@ -1891,10 +2019,13 @@ async def process_previous_week():
                         "Роль `academy` была снята."
                     )
                 )
+
             except discord.Forbidden:
                 pass
 
-    data["last_processed_week"] = previous_week_key
+    data["last_processed_week"] = (
+        previous_week_key
+    )
 
     save_data()
 
@@ -1903,10 +2034,9 @@ async def process_previous_week():
 
 @tasks.loop(minutes=1)
 async def weekly_check_loop():
-    """Проверяет, наступило ли время недельной проверки."""
+    """Запускает проверку в воскресенье в 23:59 МСК."""
     current_time = now_moscow()
 
-    # Воскресенье 23:59 по Москве
     if current_time.weekday() != 6:
         return
 
@@ -1925,15 +2055,12 @@ async def before_weekly_check_loop():
 
 
 # ============================================================
-# АВТООБНОВЛЕНИЕ БОТА
+# АВТООБНОВЛЕНИЕ
 # ============================================================
 
 @tasks.loop(minutes=1)
 async def maintenance_loop():
-    """
-    Проверяет панель и статистику.
-    Если сообщения удалены — создаёт их заново.
-    """
+    """Проверяет панель и статистику."""
     await ensure_panel_exists()
     await update_statistics_message()
 
@@ -1944,7 +2071,39 @@ async def before_maintenance_loop():
 
 
 # ============================================================
-# КОМАНДЫ АДМИНИСТРАТОРА
+# КЛАСС БОТА
+# ============================================================
+
+class AcademyReportBot(commands.Bot):
+    async def setup_hook(self):
+        # Панель участника работает после перезапуска
+        self.add_view(
+            SubmitReportView()
+        )
+
+        try:
+            synced_commands = await self.tree.sync()
+
+            print(
+                f"📋 Синхронизировано команд: "
+                f"{len(synced_commands)}"
+            )
+
+        except discord.HTTPException as error:
+            print(
+                f"❌ Ошибка синхронизации команд: "
+                f"{error}"
+            )
+
+
+bot = AcademyReportBot(
+    command_prefix="!",
+    intents=INTENTS
+)
+
+
+# ============================================================
+# АДМИНИСТРАТИВНЫЕ КОМАНДЫ
 # ============================================================
 
 @bot.tree.command(
@@ -1987,7 +2146,7 @@ async def my_statistics(
         interaction.user.id
     )
 
-    total_points = int(
+    total_points = float(
         user_data.get(
             "total_points",
             0
@@ -2009,15 +2168,26 @@ async def my_statistics(
     embed.add_field(
         name="📅 Текущая неделя",
         value=(
-            f"{weekly_points}/"
-            f"{REQUIRED_WEEKLY_POINTS} баллов"
+            f"{format_points(weekly_points)}/"
+            f"{format_points(REQUIRED_WEEKLY_POINTS)} "
+            "баллов"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="🎯 Расчёт",
+        value=(
+            f"1 стрела = "
+            f"{format_points(POINTS_PER_SHOOTOUT)} "
+            "балла"
         ),
         inline=False
     )
 
     embed.add_field(
         name="🏆 Всего баллов",
-        value=str(total_points),
+        value=format_points(total_points),
         inline=True
     )
 
@@ -2037,7 +2207,7 @@ async def my_statistics(
 
 
 # ============================================================
-# СОБЫТИЕ ГОТОВНОСТИ
+# СОБЫТИЕ READY
 # ============================================================
 
 @bot.event
@@ -2045,9 +2215,15 @@ async def on_ready():
     global data_loaded
 
     print("=" * 60)
-    print(f"✅ Бот подключён: {bot.user}")
-    print(f"🆔 ID: {bot.user.id}")
-    print(f"🌐 Серверов: {len(bot.guilds)}")
+    print(
+        f"✅ Бот подключён: {bot.user}"
+    )
+    print(
+        f"🆔 ID: {bot.user.id}"
+    )
+    print(
+        f"🌐 Серверов: {len(bot.guilds)}"
+    )
 
     for guild in bot.guilds:
         print(
