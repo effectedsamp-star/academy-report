@@ -1134,12 +1134,8 @@ class ReportModal(ui.Modal):
         )
 
         self.comment_input = ui.TextInput(
-            label="Комментарий к отчёту",
-            placeholder=(
-                "Сюда можно прикрепить файл с ссылкой "
-                "на скрины со стрел или просто написать "
-                "позитивный комментарий проверяющему"
-            ),
+            label="Ссылка на скриншоты или комментарий",
+            placeholder="Вставьте ссылку или напишите позитивный комментарий",
             style=discord.TextStyle.paragraph,
             max_length=1000,
             required=False
@@ -1454,54 +1450,110 @@ class ReprimandRemovalModal(ui.Modal):
     def __init__(self, member: discord.Member):
         super().__init__(title="Снять выговор")
         self.member = member
-        self.shoots_input = ui.TextInput(
-            label="Сколько сыграно вами стрел",
-            placeholder="Например: 5",
-            min_length=1, max_length=4, required=True
+        self.comment_input = ui.TextInput(
+            label="Ссылка на скриншоты или комментарий",
+            placeholder="Вставьте ссылку или опишите выполненное условие",
+            style=discord.TextStyle.paragraph,
+            max_length=1000,
+            required=True
         )
-        self.activity_input = ui.TextInput(
-            label="Сколько стрел/КБ/аирдропов вы сыграли",
-            placeholder="Опишите активность и приложите скриншоты в отчёте",
-            style=discord.TextStyle.paragraph, max_length=1000, required=True
-        )
-        self.add_item(self.shoots_input)
-        self.add_item(self.activity_input)
+        self.add_item(self.comment_input)
 
     async def on_submit(self, interaction: Interaction):
         if interaction.guild is None or not has_mafia_role(self.member):
-            await interaction.response.send_message("❌ Отправка доступна только участнику академки.", ephemeral=True)
+            await interaction.response.send_message(
+                "❌ Отправка доступна только участнику академки.",
+                ephemeral=True
+            )
             return
-        try:
-            shoots = int(str(self.shoots_input.value).strip())
-        except ValueError:
-            await interaction.response.send_message("❌ Количество стрел должно быть числом.", ephemeral=True)
-            return
-        if shoots <= 0:
-            await interaction.response.send_message("❌ Укажите положительное количество.", ephemeral=True)
-            return
+
         user_data = ensure_user_data(self.member.id)
-        if int(user_data.get("reprimands", 0)) <= 0:
-            await interaction.response.send_message("✅ У вас нет выговоров для снятия.", ephemeral=True)
+        if float(user_data.get("reprimands", 0)) <= 0:
+            await interaction.response.send_message(
+                "✅ У вас нет выговоров для снятия.",
+                ephemeral=True
+            )
             return
-        user_data["reprimand_removal_reports"] = int(user_data.get("reprimand_removal_reports", 0)) + 1
+
+        comment = str(self.comment_input.value).strip()
         report_id = get_report_id()
         report = {
-            "report_id": report_id, "user_id": self.member.id, "guild_id": interaction.guild.id,
-            "week_key": get_week_key(), "requested_shoots": shoots,
-            "activity": str(self.activity_input.value).strip(), "status": "pending",
-            "report_type": "reprimand_removal", "created_at": now_moscow().isoformat()
+            "report_id": report_id,
+            "user_id": self.member.id,
+            "guild_id": interaction.guild.id,
+            "week_key": get_week_key(),
+            "comment": comment,
+            "status": "pending",
+            "report_type": "reprimand_removal",
+            "created_at": now_moscow().isoformat(),
+            "reviewer_id": None,
+            "removal_amount": 0.0
         }
         data["reports"][report_id] = report
         save_data()
-        reviewer = bot.get_user(REVIEWER_ID) or await bot.fetch_user(REVIEWER_ID)
-        embed = discord.Embed(title="⚠️ Заявка на снятие выговора", color=discord.Color.orange())
-        embed.add_field(name="Участник", value=f"{self.member.mention} (`{self.member.id}`)", inline=False)
-        embed.add_field(name="Активность", value=f"Стрел: {shoots}\n{report['activity']}", inline=False)
-        embed.add_field(name="Важно", value=f"Проверить серверы только из <#{REPRIMAND_SERVERS_CHANNEL_ID}>", inline=False)
-        await reviewer.send(embed=embed, view=ReprimandRemovalReviewView(report_id))
+
+        reviewer = bot.get_user(REVIEWER_ID)
+        if reviewer is None:
+            try:
+                reviewer = await bot.fetch_user(REVIEWER_ID)
+            except discord.HTTPException:
+                reviewer = None
+
+        if reviewer is None:
+            data["reports"].pop(report_id, None)
+            save_data()
+            await interaction.response.send_message(
+                "❌ Не удалось найти проверяющего. Попробуйте позже.",
+                ephemeral=True
+            )
+            return
+
+        embed = discord.Embed(
+            title="⚠️ Заявка на снятие выговора",
+            color=discord.Color.orange(),
+            timestamp=now_moscow()
+        )
+        embed.add_field(
+            name="👤 Участник",
+            value=f"{self.member.mention} (`{self.member.id}`)",
+            inline=False
+        )
+        embed.add_field(
+            name="💬 Ссылка или комментарий",
+            value=comment[:1024] if comment else "Не указан",
+            inline=False
+        )
+        embed.add_field(
+            name="📌 Как снять выговор",
+            value=(
+                "Выиграть 3 стрелы: **-1 выговор**\n"
+                "Выиграть клатч 1 в 2: **-1 выговор**\n"
+                "Выиграть клатч 1 в 3+: **-2 выговора**\n"
+                "Простоять до конца стрелы (0:00): **-0.5 выговора**"
+            ),
+            inline=False
+        )
+        embed.set_footer(text=f"ID заявки: {report_id}")
+
+        try:
+            await reviewer.send(
+                embed=embed,
+                view=ReprimandRemovalReviewView(report_id)
+            )
+        except (discord.Forbidden, discord.HTTPException) as error:
+            print(f"❌ Ошибка отправки заявки проверяющему: {error}")
+            data["reports"].pop(report_id, None)
+            save_data()
+            await interaction.response.send_message(
+                "❌ Не удалось отправить заявку проверяющему.",
+                ephemeral=True
+            )
+            return
+
         await interaction.response.send_message(
-            f"✅ Заявка отправлена. Для снятия выговора вам потребуется посещение КБ/стрел/аирдропов/ГМП на одном из наших серверов.\n"
-            f"Проверяются только серверы из <#{REPRIMAND_SERVERS_CHANNEL_ID}>.", ephemeral=True)
+            "✅ Заявка на снятие выговора отправлена проверяющему.",
+            ephemeral=True
+        )
 
 
 class ReprimandRemovalReviewView(ui.View):
@@ -1509,38 +1561,88 @@ class ReprimandRemovalReviewView(ui.View):
         super().__init__(timeout=None)
         self.report_id = report_id
 
-    @ui.button(label="Снять выговор", emoji="✅", style=discord.ButtonStyle.success, custom_id="mafia_remove_reprimand")
-    async def approve(self, interaction: Interaction, button: ui.Button):
+    @ui.button(
+        label="Снять 1",
+        emoji="✅",
+        style=discord.ButtonStyle.success,
+        custom_id="mafia_reprimand_approve_1"
+    )
+    async def approve_one(self, interaction: Interaction, button: ui.Button):
+        await self.process_approval(interaction, 1.0)
+
+    @ui.button(
+        label="Снять 2",
+        emoji="✅",
+        style=discord.ButtonStyle.success,
+        custom_id="mafia_reprimand_approve_2"
+    )
+    async def approve_two(self, interaction: Interaction, button: ui.Button):
+        await self.process_approval(interaction, 2.0)
+
+    @ui.button(
+        label="Снять 0.5",
+        emoji="➗",
+        style=discord.ButtonStyle.secondary,
+        custom_id="mafia_reprimand_approve_half"
+    )
+    async def approve_half(self, interaction: Interaction, button: ui.Button):
+        await self.process_approval(interaction, 0.5)
+
+    @ui.button(
+        label="Отклонить",
+        emoji="❌",
+        style=discord.ButtonStyle.danger,
+        custom_id="mafia_reprimand_reject"
+    )
+    async def reject(self, interaction: Interaction, button: ui.Button):
         if interaction.user.id != REVIEWER_ID:
-            await interaction.response.send_message("❌ У вас нет доступа.", ephemeral=True); return
+            await interaction.response.send_message("❌ У вас нет доступа.", ephemeral=True)
+            return
         report = data["reports"].get(self.report_id)
         if not report or report.get("status") != "pending":
-            await interaction.response.send_message("❌ Заявка уже обработана или не найдена.", ephemeral=True); return
+            await interaction.response.send_message("❌ Заявка уже обработана или не найдена.", ephemeral=True)
+            return
+        report["status"] = "rejected"
+        report["reviewer_id"] = interaction.user.id
+        report["reviewed_at"] = now_moscow().isoformat()
+        save_data()
+        await interaction.response.edit_message(
+            content="❌ Заявка отклонена.",
+            embed=None,
+            view=None
+        )
+
+    async def process_approval(self, interaction: Interaction, amount: float):
+        if interaction.user.id != REVIEWER_ID:
+            await interaction.response.send_message("❌ У вас нет доступа.", ephemeral=True)
+            return
+        report = data["reports"].get(self.report_id)
+        if not report or report.get("status") != "pending":
+            await interaction.response.send_message("❌ Заявка уже обработана или не найдена.", ephemeral=True)
+            return
+
+        user_id = int(report["user_id"])
+        user_data = ensure_user_data(user_id)
+        before = float(user_data.get("reprimands", 0))
+        removed = min(amount, before)
+        remaining = max(0.0, before - removed)
+        user_data["reprimands"] = remaining
+
         report["status"] = "accepted"
         report["reviewer_id"] = interaction.user.id
         report["reviewed_at"] = now_moscow().isoformat()
-        remaining = remove_reprimand(int(report["user_id"]))
+        report["removal_amount"] = removed
         save_data()
-        user = bot.get_user(int(report["user_id"])) or await bot.fetch_user(int(report["user_id"]))
-        try:
-            await user.send(f"✅ Вам сняли 1 выговор. Осталось выговоров: {remaining}/{MAX_REPRIMANDS}.")
-        except discord.HTTPException:
-            pass
-        await interaction.response.edit_message(content=f"✅ Выговор снят. Осталось: {remaining}/{MAX_REPRIMANDS}.", embed=None, view=None)
-        await update_statistics_message()
 
-    @ui.button(label="Отклонить", emoji="❌", style=discord.ButtonStyle.danger, custom_id="mafia_reject_reprimand")
-    async def reject(self, interaction: Interaction, button: ui.Button):
-        if interaction.user.id != REVIEWER_ID:
-            await interaction.response.send_message("❌ У вас нет доступа.", ephemeral=True); return
-        report = data["reports"].get(self.report_id)
-        if not report or report.get("status") != "pending":
-            await interaction.response.send_message("❌ Заявка уже обработана или не найдена.", ephemeral=True); return
-        report["status"] = "rejected"; report["reviewer_id"] = interaction.user.id; save_data()
-        user = bot.get_user(int(report["user_id"])) or await bot.fetch_user(int(report["user_id"]))
-        try: await user.send("❌ Заявка на снятие выговора отклонена. Скриншоты должны быть с серверов из разрешённого канала.")
-        except discord.HTTPException: pass
-        await interaction.response.edit_message(content="❌ Заявка отклонена.", embed=None, view=None)
+        await interaction.response.edit_message(
+            content=(
+                f"✅ Снято: {format_points(removed)}. "
+                f"Осталось: {format_points(remaining)}/{MAX_REPRIMANDS}."
+            ),
+            embed=None,
+            view=None
+        )
+        await update_statistics_message()
 
 
 # ============================================================
@@ -2040,14 +2142,10 @@ def create_panel_embed() -> discord.Embed:
             "один выговор.\n"
             "После **5 выговоров** вы покидаете нашу семью автоматически.\n\n"
             "**Как снять выговор:**\n"
-            "Взятие 5 кораблей: **-1 выговор**\n"
-            "Взятие аирдропа: **-1 выговор**\n"
-            "Сыграть 5 стрел: **-1 выговор**\n"
-            "Участие в ГМП: **-1 выговор**\n\n"
-            "**Примечание:** в обязательном порядке при снятии выговора "
-            "играйте на серверах, которые находятся в канале "
-            f"<#{REPRIMAND_SERVERS_CHANNEL_ID}>. Имя канала показывается выше. "
-            "Скриншоты с других серверов аннулируются.\n"
+            "Выиграть 3 стрелы: **-1 выговор**\n"
+            "Выиграть клатч 1 в 2: **-1 выговор**\n"
+            "Выиграть клатч 1 в 3+: **-2 выговора**\n"
+            "Простоять до конца стрелы (0:00): **-0.5 выговора**\n\n"
         ),
         color=discord.Color.from_rgb(
             55,
@@ -2633,6 +2731,31 @@ async def unbal(interaction: Interaction, user: discord.Member, points: float):
     try: await user.send(f"⚠️ Вам сняли {format_points(points)} баллов.\nВаши баллы: {format_points(total)}")
     except discord.HTTPException: pass
     await interaction.response.send_message(f"✅ Снято {format_points(points)} баллов у {user.mention}. Баланс: {format_points(total)}.", ephemeral=True)
+
+
+@bot.tree.command(name="выдать_выговор", description="Выдать выговор участнику")
+@app_commands.guild_only()
+@app_commands.describe(user="Участник")
+async def issue_reprimand_command(interaction: Interaction, user: discord.Member):
+    if not is_admin_user(interaction):
+        await interaction.response.send_message("❌ У вас нет доступа.", ephemeral=True)
+        return
+    if user.bot:
+        await interaction.response.send_message("❌ Нельзя выдать выговор боту.", ephemeral=True)
+        return
+    reprimands = add_reprimand(user.id, 1)
+    save_data()
+    await update_statistics_message()
+    try:
+        await user.send(f"⚠️ Вам выдан 1 выговор. Всего: {reprimands}/{MAX_REPRIMANDS}.")
+    except discord.HTTPException:
+        pass
+    if reprimands >= MAX_REPRIMANDS:
+        await remove_mafia_roles(user, "Получено 5 выговоров")
+    await interaction.response.send_message(
+        f"✅ Пользователю {user.mention} выдан 1 выговор. Всего: {reprimands}/{MAX_REPRIMANDS}.",
+        ephemeral=True
+    )
 
 
 @bot.tree.command(name="снять_выговор", description="Снять выговор у участника")
