@@ -25,6 +25,9 @@ GUILD_ID = 1534179608390406308
 REPORTS_CHANNEL_ID = 1552806315472982086
 STATS_CHANNEL_ID = 1552806315472982086
 
+# Канал, серверы из которого разрешены для отчётов о снятии выговора
+REPRIMAND_SERVERS_CHANNEL_ID = 1540010365839089775
+
 REVIEWER_ID = 1416863224430596107
 
 MAFIA_ROLE_NAME = "academy"
@@ -177,7 +180,8 @@ def ensure_user_data(user_id: int):
     if user_key not in data["users"]:
         data["users"][user_key] = {
             "total_points": 0.0,
-            "reprimands": 0
+            "reprimands": 0,
+            "reprimand_removal_reports": 0
         }
 
     user_data = data["users"][user_key]
@@ -187,6 +191,9 @@ def ensure_user_data(user_id: int):
 
     if "reprimands" not in user_data:
         user_data["reprimands"] = 0
+
+    if "reprimand_removal_reports" not in user_data:
+        user_data["reprimand_removal_reports"] = 0
 
     return user_data
 
@@ -256,9 +263,7 @@ def add_weekly_points(
         old_weekly_points + points
     )
 
-    user_data = ensure_user_data(
-        user_id
-    )
+    user_data = ensure_user_data(user_id)
 
     user_data["total_points"] = float(
         user_data.get(
@@ -269,7 +274,38 @@ def add_weekly_points(
 
 
 # ============================================================
-# ВРЕМЯ И ОТЧЁТНЫЕ НЕДЕЛИ
+# РУЧНЫЕ ОПЕРАЦИИ С БАЛЛАМИ И ВЫГОВОРАМИ
+# ============================================================
+
+def change_user_points(user_id: int, points: float, week_key: str | None = None):
+    """Изменяет общий и недельный баланс; баланс может быть отрицательным."""
+    if week_key is None:
+        week_key = get_week_key()
+    if week_key not in data["weekly_points"]:
+        data["weekly_points"][week_key] = {}
+    user_key = str(user_id)
+    data["weekly_points"][week_key][user_key] = (
+        float(data["weekly_points"][week_key].get(user_key, 0)) + points
+    )
+    user_data = ensure_user_data(user_id)
+    user_data["total_points"] = float(user_data.get("total_points", 0)) + points
+    return user_data["total_points"], data["weekly_points"][week_key][user_key]
+
+
+def add_reprimand(user_id: int, amount: int = 1) -> int:
+    user_data = ensure_user_data(user_id)
+    user_data["reprimands"] = max(0, int(user_data.get("reprimands", 0)) + amount)
+    return user_data["reprimands"]
+
+
+def remove_reprimand(user_id: int, amount: int = 1) -> int:
+    user_data = ensure_user_data(user_id)
+    user_data["reprimands"] = max(0, int(user_data.get("reprimands", 0)) - amount)
+    return user_data["reprimands"]
+
+
+# ============================================================
+# ВРЕМЯ И НЕДЕЛИ
 # ============================================================
 
 def now_moscow() -> datetime:
@@ -318,9 +354,7 @@ def get_week_dates(
         week_key = get_week_key()
 
     try:
-        monday_text, sunday_text = week_key.split(
-            "_"
-        )
+        monday_text, sunday_text = week_key.split("_")
 
         monday = datetime.strptime(
             monday_text,
@@ -369,9 +403,7 @@ def get_week_display(
     week_key: str | None = None
 ) -> str:
     """Красивое отображение отчётной недели."""
-    monday, sunday = get_week_dates(
-        week_key
-    )
+    monday, sunday = get_week_dates(week_key)
 
     return (
         f"{monday.strftime('%d.%m.%Y')} — "
@@ -397,9 +429,7 @@ def get_previous_week_key() -> str:
         days=1
     )
 
-    return get_week_key(
-        previous_sunday
-    )
+    return get_week_key(previous_sunday)
 
 
 # ============================================================
@@ -457,7 +487,8 @@ async def remove_mafia_roles(
 
     if member.guild.me is None:
         print(
-            "❌ Не удалось определить бота на сервере."
+            "❌ Не удалось определить бота "
+            "на сервере."
         )
         return
 
@@ -537,27 +568,192 @@ def get_pending_report_for_user(
     return None
 
 
-def has_accepted_report_for_week(
-    user_id: int,
-    week_key: str | None = None
-) -> bool:
-    """Проверяет, есть ли уже принятый отчёт."""
-    if week_key is None:
-        week_key = get_week_key()
+# ============================================================
+# EMBED УВЕДОМЛЕНИЙ
+# ============================================================
 
-    for report in data["reports"].values():
-        if (
-            int(report.get("user_id", 0)) == user_id
-            and report.get("week_key") == week_key
-            and report.get("status") == "accepted"
-        ):
-            return True
+async def send_report_pending_dm(
+    user: discord.User,
+    report: dict
+):
+    """Уведомление об отправке отчёта."""
+    requested_shoots = int(
+        report.get("requested_shoots", 0)
+    )
 
-    return False
+    calculated_points = float(
+        report.get("calculated_points", 0)
+    )
+
+    embed = discord.Embed(
+        title="📨 Отчёт отправлен на проверку",
+        description=(
+            "Ваш отчёт успешно получен и передан "
+            "проверяющему."
+        ),
+        color=discord.Color.orange(),
+        timestamp=now_moscow()
+    )
+
+    embed.add_field(
+        name="🎯 Заявлено стрел",
+        value=str(requested_shoots),
+        inline=True
+    )
+
+    embed.add_field(
+        name="💰 Возможное начисление",
+        value=(
+            f"**{format_points(calculated_points)} балла**"
+        ),
+        inline=True
+    )
+
+    embed.add_field(
+        name="📅 Отчётная неделя",
+        value=get_week_display(
+            report.get("week_key")
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="⏳ Статус",
+        value="Ожидает проверки администратора",
+        inline=False
+    )
+
+    embed.set_footer(
+        text=f"ID отчёта: {report.get('report_id')}"
+    )
+
+    await user.send(embed=embed)
+
+
+async def send_report_accepted_dm(
+    user: discord.User,
+    report: dict
+):
+    """Уведомление о начислении баллов."""
+    requested_shoots = int(
+        report.get("requested_shoots", 0)
+    )
+
+    accepted_points = float(
+        report.get("accepted_points", 0)
+    )
+
+    weekly_points = get_weekly_points(
+        int(report["user_id"]),
+        report.get("week_key")
+    )
+
+    embed = discord.Embed(
+        title="✅ Баллы начислены",
+        description=(
+            "Ваш отчёт был проверен и одобрен.\n\n"
+            "Указанные баллы добавлены "
+            "в вашу статистику."
+        ),
+        color=discord.Color.green(),
+        timestamp=now_moscow()
+    )
+
+    embed.add_field(
+        name="🎯 Стрелы в отчёте",
+        value=str(requested_shoots),
+        inline=True
+    )
+
+    embed.add_field(
+        name="💰 Начислено",
+        value=(
+            f"**{format_points(accepted_points)} балла**"
+        ),
+        inline=True
+    )
+
+    embed.add_field(
+        name="📊 Баллы за неделю",
+        value=(
+            f"**{format_points(weekly_points)}/"
+            f"{format_points(REQUIRED_WEEKLY_POINTS)}**"
+        ),
+        inline=True
+    )
+
+    embed.add_field(
+        name="📅 Отчётная неделя",
+        value=get_week_display(
+            report.get("week_key")
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="📌 Итог",
+        value="Отчёт принят, баллы сохранены.",
+        inline=False
+    )
+
+    embed.set_footer(
+        text=f"ID отчёта: {report.get('report_id')}"
+    )
+
+    await user.send(embed=embed)
+
+
+async def send_report_rejected_dm(
+    user: discord.User,
+    report: dict
+):
+    """Уведомление об отказе в начислении баллов."""
+    reason = str(
+        report.get("reason", "")
+    ).strip()
+
+    embed = discord.Embed(
+        title="❌ В начислении баллов отказано",
+        description=(
+            "Ваш отчёт был проверен, "
+            "но баллы не были начислены."
+        ),
+        color=discord.Color.red(),
+        timestamp=now_moscow()
+    )
+
+    embed.add_field(
+        name="📅 Отчётная неделя",
+        value=get_week_display(
+            report.get("week_key")
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="📝 Причина отказа",
+        value=reason or "Причина не указана",
+        inline=False
+    )
+
+    embed.add_field(
+        name="📌 Итог",
+        value=(
+            "Исправьте недочёты и отправьте "
+            "новый отчёт."
+        ),
+        inline=False
+    )
+
+    embed.set_footer(
+        text=f"ID отчёта: {report.get('report_id')}"
+    )
+
+    await user.send(embed=embed)
 
 
 # ============================================================
-# EMBED ОТЧЁТА
+# EMBED ОТЧЁТА ДЛЯ ПРОВЕРЯЮЩЕГО
 # ============================================================
 
 def create_report_embed(
@@ -637,8 +833,8 @@ def create_report_embed(
     embed = discord.Embed(
         title="📨 Недельный отчёт",
         description=(
-            "Проверьте скриншоты и решите, "
-            "засчитать ли баллы."
+            "Проверьте скриншоты или ссылку "
+            "на скриншоты и решите, начислять ли баллы."
         ),
         color=status_color
     )
@@ -659,9 +855,7 @@ def create_report_embed(
 
     embed.add_field(
         name="🎯 Заявлено стрел",
-        value=str(
-            requested_shoots
-        ),
+        value=str(requested_shoots),
         inline=True
     )
 
@@ -707,7 +901,7 @@ def create_report_embed(
     ).strip()
 
     embed.add_field(
-        name="💬 Комментарий",
+        name="💬 Ссылка или комментарий",
         value=(
             comment[:1024]
             if comment
@@ -826,7 +1020,6 @@ def create_statistics_embed(
 
         if weekly_points >= REQUIRED_WEEKLY_POINTS:
             status = "✅"
-
         else:
             status = "⏳"
 
@@ -839,7 +1032,7 @@ def create_statistics_embed(
             f"**{format_points(weekly_points)}/"
             f"{format_points(REQUIRED_WEEKLY_POINTS)}** "
             f"· Всего: **{format_points(total_points)}** "
-            f"· В/г: **{reprimands}/"
+            f"· Выговоры: **{reprimands}/"
             f"{MAX_REPRIMANDS}**"
         )
 
@@ -885,6 +1078,39 @@ def create_statistics_embed(
 
 
 # ============================================================
+# УДАЛЕНИЕ СООБЩЕНИЯ СО СКРИНШОТАМИ
+# ============================================================
+
+async def delete_attachment_message(
+    message: discord.Message
+):
+    """Удаляет сообщение пользователя со скриншотами."""
+    try:
+        await message.delete()
+        print(
+            f"🗑️ Удалено сообщение "
+            f"со скриншотами: {message.id}"
+        )
+
+    except discord.Forbidden:
+        print(
+            "❌ Нет права удалять сообщения "
+            "в канале отчётов."
+        )
+
+    except discord.NotFound:
+        print(
+            "⚠️ Сообщение со скриншотами "
+            "уже удалено."
+        )
+
+    except discord.HTTPException as error:
+        print(
+            f"❌ Ошибка удаления сообщения: {error}"
+        )
+
+
+# ============================================================
 # MODAL ОТПРАВКИ ОТЧЁТА
 # ============================================================
 
@@ -910,7 +1136,9 @@ class ReportModal(ui.Modal):
         self.comment_input = ui.TextInput(
             label="Комментарий к отчёту",
             placeholder=(
-                "Напишите, за что получены стрелы"
+                "Сюда можно прикрепить файл с ссылкой "
+                "на скрины со стрел или просто написать "
+                "позитивный комментарий проверяющему"
             ),
             style=discord.TextStyle.paragraph,
             max_length=1000,
@@ -934,6 +1162,16 @@ class ReportModal(ui.Modal):
         if guild is None:
             await interaction.response.send_message(
                 "❌ Отчёты принимаются только на сервере.",
+                ephemeral=True
+            )
+            return
+
+        if not isinstance(
+            self.member,
+            discord.Member
+        ):
+            await interaction.response.send_message(
+                "❌ Не удалось определить участника.",
                 ephemeral=True
             )
             return
@@ -962,7 +1200,8 @@ class ReportModal(ui.Modal):
 
         if requested_shoots <= 0:
             await interaction.response.send_message(
-                "❌ Количество стрел должно быть больше нуля.",
+                "❌ Количество стрел должно быть "
+                "больше нуля.",
                 ephemeral=True
             )
             return
@@ -976,22 +1215,20 @@ class ReportModal(ui.Modal):
 
         week_key = get_week_key()
 
+        # Разрешены повторные отчёты за неделю.
+        # Запрещён только второй отчёт,
+        # пока предыдущий находится на проверке.
         if get_pending_report_for_user(
             self.member.id,
             week_key
         ):
             await interaction.response.send_message(
-                "❌ У вас уже есть отчёт на проверке.",
-                ephemeral=True
-            )
-            return
-
-        if has_accepted_report_for_week(
-            self.member.id,
-            week_key
-        ):
-            await interaction.response.send_message(
-                "❌ За эту неделю отчёт уже принят.",
+                (
+                    "❌ У вас уже есть отчёт "
+                    "на проверке.\n"
+                    "Дождитесь его обработки, после чего "
+                    "сможете отправить следующий."
+                ),
                 ephemeral=True
             )
             return
@@ -999,62 +1236,82 @@ class ReportModal(ui.Modal):
         await interaction.response.send_message(
             (
                 "📎 Теперь отправьте в этот канал "
-                "сообщение со скриншотами отчёта.\n\n"
+                "сообщение со скриншотами отчёта "
+                "или укажите ссылку на скриншоты "
+                "в комментарии.\n\n"
                 f"Заявлено стрел: **{requested_shoots}**\n"
-                f"Расчёт: **{format_points(shoots_to_points(requested_shoots))} балла**\n\n"
-                "В одном сообщении можно прикрепить "
-                "несколько изображений."
+                f"Расчёт: **"
+                f"{format_points(shoots_to_points(requested_shoots))} "
+                f"балла**\n\n"
+                "Если прикрепляете скриншоты, "
+                "их можно отправить одним сообщением."
             ),
             ephemeral=True
         )
 
-        try:
-            attachment_message = await bot.wait_for(
-                "message",
-                timeout=600,
-                check=lambda message: (
-                    message.author.id == self.member.id
-                    and message.channel.id
-                    == REPORTS_CHANNEL_ID
-                    and len(message.attachments) > 0
-                )
-            )
+        comment = str(
+            self.comment_input.value
+        ).strip()
 
-        except asyncio.TimeoutError:
+        # Если в комментарии есть ссылка,
+        # сообщение со скриншотами можно не отправлять
+        has_link_in_comment = (
+            "http://" in comment.lower()
+            or "https://" in comment.lower()
+            or "www." in comment.lower()
+        )
+
+        attachment_message = None
+        image_attachments = []
+
+        if not has_link_in_comment:
             try:
-                await self.member.send(
-                    (
-                        "⌛ Время ожидания скриншотов "
-                        "истекло.\n"
-                        "Отчёт не был создан."
+                attachment_message = await bot.wait_for(
+                    "message",
+                    timeout=600,
+                    check=lambda message: (
+                        message.author.id == self.member.id
+                        and message.channel.id
+                        == REPORTS_CHANNEL_ID
+                        and len(message.attachments) > 0
                     )
                 )
 
-            except discord.Forbidden:
-                pass
-
-            return
-
-        image_attachments = [
-            attachment
-            for attachment in attachment_message.attachments
-            if is_allowed_image(attachment)
-        ]
-
-        if not image_attachments:
-            try:
-                await self.member.send(
-                    (
-                        "❌ Отчёт не принят.\n"
-                        "В сообщении не найдено "
-                        "изображений."
+            except asyncio.TimeoutError:
+                try:
+                    await self.member.send(
+                        (
+                            "⌛ Время ожидания скриншотов "
+                            "истекло.\n"
+                            "Отчёт не был создан."
+                        )
                     )
-                )
 
-            except discord.Forbidden:
-                pass
+                except discord.Forbidden:
+                    pass
 
-            return
+                return
+
+            image_attachments = [
+                attachment
+                for attachment in attachment_message.attachments
+                if is_allowed_image(attachment)
+            ]
+
+            if not image_attachments:
+                try:
+                    await self.member.send(
+                        (
+                            "❌ Отчёт не принят.\n"
+                            "В сообщении не найдено "
+                            "изображений."
+                        )
+                    )
+
+                except discord.Forbidden:
+                    pass
+
+                return
 
         report_id = get_report_id()
 
@@ -1070,14 +1327,16 @@ class ReportModal(ui.Modal):
             "requested_shoots": requested_shoots,
             "calculated_points": calculated_points,
             "accepted_points": 0.0,
-            "comment": str(
-                self.comment_input.value
-            ).strip(),
+            "comment": comment,
             "attachment_urls": [
                 attachment.url
                 for attachment in image_attachments
             ],
-            "source_message_id": attachment_message.id,
+            "source_message_id": (
+                attachment_message.id
+                if attachment_message
+                else None
+            ),
             "status": "pending",
             "reviewer_id": None,
             "reason": "",
@@ -1097,6 +1356,7 @@ class ReportModal(ui.Modal):
                 reviewer = await bot.fetch_user(
                     REVIEWER_ID
                 )
+
             except discord.HTTPException:
                 reviewer = None
 
@@ -1129,29 +1389,48 @@ class ReportModal(ui.Modal):
 
             save_data()
 
+            # Отправляем скриншоты проверяющему
+            # настоящими файлами
             for attachment in image_attachments:
                 try:
-                    await reviewer.send(
-                        attachment.url
+                    image_file = await attachment.to_file(
+                        spoiler=False
                     )
-                except discord.HTTPException:
-                    pass
+
+                    await reviewer.send(
+                        file=image_file
+                    )
+
+                except discord.HTTPException as error:
+                    print(
+                        f"❌ Не удалось отправить "
+                        f"скриншот проверяющему: {error}"
+                    )
+
+            # После копирования удаляем сообщение
+            # со скриншотами из общего канала
+            if attachment_message is not None:
+                await delete_attachment_message(
+                    attachment_message
+                )
 
             try:
-                await self.member.send(
-                    (
-                        "✅ Ваш отчёт отправлен "
-                        "на проверку.\n\n"
-                        f"Стрел: **{requested_shoots}**\n"
-                        f"Баллов по расчёту: **"
-                        f"{format_points(calculated_points)}**\n"
-                        f"Неделя: **"
-                        f"{get_week_display(week_key)}**"
-                    )
+                await send_report_pending_dm(
+                    self.member,
+                    report
                 )
 
             except discord.Forbidden:
-                pass
+                print(
+                    "⚠️ Нельзя отправить уведомление "
+                    "о подаче отчёта в ЛС."
+                )
+
+            except discord.HTTPException as error:
+                print(
+                    f"⚠️ Ошибка уведомления "
+                    f"о подаче отчёта: {error}"
+                )
 
             await update_statistics_message()
 
@@ -1160,8 +1439,7 @@ class ReportModal(ui.Modal):
                 (
                     "❌ Не удалось отправить отчёт "
                     "проверяющему в личные сообщения.\n"
-                    "Откройте личные сообщения "
-                    "для сервера."
+                    "Проверьте, открыты ли ЛС."
                 ),
                 ephemeral=True
             )
@@ -1170,6 +1448,99 @@ class ReportModal(ui.Modal):
             print(
                 f"❌ Ошибка отправки отчёта: {error}"
             )
+
+
+class ReprimandRemovalModal(ui.Modal):
+    def __init__(self, member: discord.Member):
+        super().__init__(title="Снять выговор")
+        self.member = member
+        self.shoots_input = ui.TextInput(
+            label="Сколько сыграно вами стрел",
+            placeholder="Например: 5",
+            min_length=1, max_length=4, required=True
+        )
+        self.activity_input = ui.TextInput(
+            label="Сколько стрел/КБ/аирдропов вы сыграли",
+            placeholder="Опишите активность и приложите скриншоты в отчёте",
+            style=discord.TextStyle.paragraph, max_length=1000, required=True
+        )
+        self.add_item(self.shoots_input)
+        self.add_item(self.activity_input)
+
+    async def on_submit(self, interaction: Interaction):
+        if interaction.guild is None or not has_mafia_role(self.member):
+            await interaction.response.send_message("❌ Отправка доступна только участнику академки.", ephemeral=True)
+            return
+        try:
+            shoots = int(str(self.shoots_input.value).strip())
+        except ValueError:
+            await interaction.response.send_message("❌ Количество стрел должно быть числом.", ephemeral=True)
+            return
+        if shoots <= 0:
+            await interaction.response.send_message("❌ Укажите положительное количество.", ephemeral=True)
+            return
+        user_data = ensure_user_data(self.member.id)
+        if int(user_data.get("reprimands", 0)) <= 0:
+            await interaction.response.send_message("✅ У вас нет выговоров для снятия.", ephemeral=True)
+            return
+        user_data["reprimand_removal_reports"] = int(user_data.get("reprimand_removal_reports", 0)) + 1
+        report_id = get_report_id()
+        report = {
+            "report_id": report_id, "user_id": self.member.id, "guild_id": interaction.guild.id,
+            "week_key": get_week_key(), "requested_shoots": shoots,
+            "activity": str(self.activity_input.value).strip(), "status": "pending",
+            "report_type": "reprimand_removal", "created_at": now_moscow().isoformat()
+        }
+        data["reports"][report_id] = report
+        save_data()
+        reviewer = bot.get_user(REVIEWER_ID) or await bot.fetch_user(REVIEWER_ID)
+        embed = discord.Embed(title="⚠️ Заявка на снятие выговора", color=discord.Color.orange())
+        embed.add_field(name="Участник", value=f"{self.member.mention} (`{self.member.id}`)", inline=False)
+        embed.add_field(name="Активность", value=f"Стрел: {shoots}\n{report['activity']}", inline=False)
+        embed.add_field(name="Важно", value=f"Проверить серверы только из <#{REPRIMAND_SERVERS_CHANNEL_ID}>", inline=False)
+        await reviewer.send(embed=embed, view=ReprimandRemovalReviewView(report_id))
+        await interaction.response.send_message(
+            f"✅ Заявка отправлена. Для снятия выговора вам потребуется посещение КБ/стрел/аирдропов/ГМП на одном из наших серверов.\n"
+            f"Проверяются только серверы из <#{REPRIMAND_SERVERS_CHANNEL_ID}>.", ephemeral=True)
+
+
+class ReprimandRemovalReviewView(ui.View):
+    def __init__(self, report_id: str):
+        super().__init__(timeout=None)
+        self.report_id = report_id
+
+    @ui.button(label="Снять выговор", emoji="✅", style=discord.ButtonStyle.success, custom_id="mafia_remove_reprimand")
+    async def approve(self, interaction: Interaction, button: ui.Button):
+        if interaction.user.id != REVIEWER_ID:
+            await interaction.response.send_message("❌ У вас нет доступа.", ephemeral=True); return
+        report = data["reports"].get(self.report_id)
+        if not report or report.get("status") != "pending":
+            await interaction.response.send_message("❌ Заявка уже обработана или не найдена.", ephemeral=True); return
+        report["status"] = "accepted"
+        report["reviewer_id"] = interaction.user.id
+        report["reviewed_at"] = now_moscow().isoformat()
+        remaining = remove_reprimand(int(report["user_id"]))
+        save_data()
+        user = bot.get_user(int(report["user_id"])) or await bot.fetch_user(int(report["user_id"]))
+        try:
+            await user.send(f"✅ Вам сняли 1 выговор. Осталось выговоров: {remaining}/{MAX_REPRIMANDS}.")
+        except discord.HTTPException:
+            pass
+        await interaction.response.edit_message(content=f"✅ Выговор снят. Осталось: {remaining}/{MAX_REPRIMANDS}.", embed=None, view=None)
+        await update_statistics_message()
+
+    @ui.button(label="Отклонить", emoji="❌", style=discord.ButtonStyle.danger, custom_id="mafia_reject_reprimand")
+    async def reject(self, interaction: Interaction, button: ui.Button):
+        if interaction.user.id != REVIEWER_ID:
+            await interaction.response.send_message("❌ У вас нет доступа.", ephemeral=True); return
+        report = data["reports"].get(self.report_id)
+        if not report or report.get("status") != "pending":
+            await interaction.response.send_message("❌ Заявка уже обработана или не найдена.", ephemeral=True); return
+        report["status"] = "rejected"; report["reviewer_id"] = interaction.user.id; save_data()
+        user = bot.get_user(int(report["user_id"])) or await bot.fetch_user(int(report["user_id"]))
+        try: await user.send("❌ Заявка на снятие выговора отклонена. Скриншоты должны быть с серверов из разрешённого канала.")
+        except discord.HTTPException: pass
+        await interaction.response.edit_message(content="❌ Заявка отклонена.", embed=None, view=None)
 
 
 # ============================================================
@@ -1195,7 +1566,10 @@ class SubmitReportView(ui.View):
     ):
         member = interaction.user
 
-        if not isinstance(member, discord.Member):
+        if not isinstance(
+            member,
+            discord.Member
+        ):
             await interaction.response.send_message(
                 "❌ Не удалось определить участника.",
                 ephemeral=True
@@ -1212,22 +1586,20 @@ class SubmitReportView(ui.View):
 
         week_key = get_week_key()
 
+        # Проверяем только активный отчёт
+        # на проверке. Принятые отчёты не блокируют
+        # повторную подачу.
         if get_pending_report_for_user(
             member.id,
             week_key
         ):
             await interaction.response.send_message(
-                "❌ У вас уже есть отчёт на проверке.",
-                ephemeral=True
-            )
-            return
-
-        if has_accepted_report_for_week(
-            member.id,
-            week_key
-        ):
-            await interaction.response.send_message(
-                "❌ За эту неделю отчёт уже принят.",
+                (
+                    "❌ У вас уже есть отчёт "
+                    "на проверке.\n"
+                    "После его обработки можно будет "
+                    "отправить следующий."
+                ),
                 ephemeral=True
             )
             return
@@ -1235,6 +1607,22 @@ class SubmitReportView(ui.View):
         await interaction.response.send_modal(
             ReportModal(member)
         )
+
+    @ui.button(
+        label="Снять выговор",
+        emoji="⚠️",
+        style=discord.ButtonStyle.danger,
+        custom_id="mafia_remove_reprimand_button"
+    )
+    async def remove_reprimand_button(self, interaction: Interaction, button: ui.Button):
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not has_mafia_role(member):
+            await interaction.response.send_message(f"❌ Для снятия выговора нужна роль `{MAFIA_ROLE_NAME}`.", ephemeral=True)
+            return
+        if int(ensure_user_data(member.id).get("reprimands", 0)) <= 0:
+            await interaction.response.send_message("✅ У вас нет выговоров для снятия.", ephemeral=True)
+            return
+        await interaction.response.send_modal(ReprimandRemovalModal(member))
 
     @ui.button(
         label="Моя статистика",
@@ -1434,23 +1822,9 @@ class ReportReviewView(ui.View):
                     int(report["user_id"])
                 )
 
-            current_weekly_points = (
-                get_weekly_points(
-                    int(report["user_id"]),
-                    report["week_key"]
-                )
-            )
-
-            await user.send(
-                (
-                    "✅ Ваш отчёт принят.\n\n"
-                    f"Стрел: **{requested_shoots}**\n"
-                    f"Начислено баллов: **"
-                    f"{format_points(points)}**\n"
-                    f"За неделю: **"
-                    f"{format_points(current_weekly_points)}/"
-                    f"{format_points(REQUIRED_WEEKLY_POINTS)}**"
-                )
+            await send_report_accepted_dm(
+                user,
+                report
             )
 
         except discord.Forbidden:
@@ -1611,11 +1985,9 @@ class RejectReportModal(ui.Modal):
                     int(report["user_id"])
                 )
 
-            await user.send(
-                (
-                    "❌ Ваш отчёт отклонён.\n\n"
-                    f"Причина отказа:\n{reason}"
-                )
+            await send_report_rejected_dm(
+                user,
+                report
             )
 
         except discord.Forbidden:
@@ -1644,21 +2016,38 @@ def create_panel_embed() -> discord.Embed:
         description=(
             "Каждую неделю участники мафии должны "
             "набрать минимум **5 баллов**.\n\n"
+
             "**Расчёт баллов:**\n"
             "🎯 **1 стрела = 0.5 балла**\n"
             "🎯 **2 стрелы = 1 балл**\n"
             "🎯 **10 стрел = 5 баллов**\n\n"
+
             "**Как подать отчёт:**\n"
             "1. Нажмите `📨 Подать отчёт`.\n"
             "2. Укажите количество стрел.\n"
-            "3. Напишите комментарий.\n"
-            "4. Отправьте скриншоты в этот канал.\n"
+            "3. В комментарии можно написать почему ваш отчет должен быть проверен.\n"
+            "4. Отправьте скриншоты в этот канал "
+            "или прикрепите ссылку в комментарии "
+            "отчёта на ваши скрины.\n"
             "5. Дождитесь проверки администратора.\n\n"
+
+            "За неделю в обязательном порядке нужно давать отчеты о вашей работе.\n"
+            "При этом если вы не набираете нужное "
+            "количество баллов за неделю вам дается выговор.\n\n"
+
             "Если за неделю набрано меньше "
             "**5 баллов**, участник получает "
             "один выговор.\n"
-            "После **5 выговоров** роль "
-            "`academy` снимается."
+            "После **5 выговоров** вы покидаете нашу семью автоматически.\n\n"
+            "**Как снять выговор:**\n"
+            "Взятие 5 кораблей: **-1 выговор**\n"
+            "Взятие аирдропа: **-1 выговор**\n"
+            "Сыграть 5 стрел: **-1 выговор**\n"
+            "Участие в ГМП: **-1 выговор**\n\n"
+            "**Примечание:** в обязательном порядке при снятии выговора "
+            "играйте на серверах, которые находятся в канале "
+            f"<#{REPRIMAND_SERVERS_CHANNEL_ID}>. Имя канала показывается выше. "
+            "Скриншоты с других серверов аннулируются.\n"
         ),
         color=discord.Color.from_rgb(
             55,
@@ -1710,7 +2099,10 @@ async def ensure_panel_exists():
         )
         return
 
-    if not isinstance(channel, discord.TextChannel):
+    if not isinstance(
+        channel,
+        discord.TextChannel
+    ):
         print(
             "❌ Канал отчётов должен быть текстовым."
         )
@@ -1843,7 +2235,10 @@ async def update_statistics_message():
         )
         return
 
-    if not isinstance(channel, discord.TextChannel):
+    if not isinstance(
+        channel,
+        discord.TextChannel
+    ):
         return
 
     embed = create_statistics_embed(
@@ -2016,7 +2411,8 @@ async def process_previous_week():
                 await member.send(
                     (
                         "🚫 Вы получили 5 выговоров.\n\n"
-                        "Роль `academy` была снята."
+                        f"Роль `{MAFIA_ROLE_NAME}` "
+                        "была снята."
                     )
                 )
 
@@ -2076,7 +2472,6 @@ async def before_maintenance_loop():
 
 class AcademyReportBot(commands.Bot):
     async def setup_hook(self):
-        # Панель участника работает после перезапуска
         self.add_view(
             SubmitReportView()
         )
@@ -2206,6 +2601,55 @@ async def my_statistics(
     )
 
 
+def is_admin_user(interaction: Interaction) -> bool:
+    return interaction.user.id == REVIEWER_ID or (isinstance(interaction.user, discord.Member) and interaction.user.guild_permissions.manage_guild)
+
+
+@bot.tree.command(name="addbal", description="Добавить баллы участнику академки")
+@app_commands.guild_only()
+@app_commands.describe(user="Участник", points="Количество баллов")
+async def addbal(interaction: Interaction, user: discord.Member, points: float):
+    if not is_admin_user(interaction):
+        await interaction.response.send_message("❌ У вас нет доступа.", ephemeral=True); return
+    if points <= 0:
+        await interaction.response.send_message("❌ Укажите положительное число.", ephemeral=True); return
+    total, weekly = change_user_points(user.id, points)
+    save_data(); await update_statistics_message()
+    try: await user.send(f"✅ Вам выдали +{format_points(points)} баллов.\nВаши баллы: {format_points(total)}/{format_points(REQUIRED_WEEKLY_POINTS)} баллов.")
+    except discord.HTTPException: pass
+    await interaction.response.send_message(f"✅ Выдано {format_points(points)} баллов пользователю {user.mention}. Баланс: {format_points(total)}.", ephemeral=True)
+
+
+@bot.tree.command(name="unbal", description="Снять баллы с участника академки")
+@app_commands.guild_only()
+@app_commands.describe(user="Участник", points="Количество снимаемых баллов")
+async def unbal(interaction: Interaction, user: discord.Member, points: float):
+    if not is_admin_user(interaction):
+        await interaction.response.send_message("❌ У вас нет доступа.", ephemeral=True); return
+    if points <= 0:
+        await interaction.response.send_message("❌ Укажите положительное число.", ephemeral=True); return
+    total, weekly = change_user_points(user.id, -points)
+    save_data(); await update_statistics_message()
+    try: await user.send(f"⚠️ Вам сняли {format_points(points)} баллов.\nВаши баллы: {format_points(total)}")
+    except discord.HTTPException: pass
+    await interaction.response.send_message(f"✅ Снято {format_points(points)} баллов у {user.mention}. Баланс: {format_points(total)}.", ephemeral=True)
+
+
+@bot.tree.command(name="снять_выговор", description="Снять выговор у участника")
+@app_commands.guild_only()
+@app_commands.describe(user="Участник", amount="Количество выговоров")
+async def remove_reprimand_command(interaction: Interaction, user: discord.Member, amount: int = 1):
+    if not is_admin_user(interaction):
+        await interaction.response.send_message("❌ У вас нет доступа.", ephemeral=True); return
+    if amount <= 0:
+        await interaction.response.send_message("❌ Количество должно быть положительным.", ephemeral=True); return
+    before = int(ensure_user_data(user.id).get("reprimands", 0)); after = remove_reprimand(user.id, amount)
+    removed = before - after; save_data(); await update_statistics_message()
+    try: await user.send(f"✅ Вам сняли {removed} выговор(ов). Осталось: {after}/{MAX_REPRIMANDS}.")
+    except discord.HTTPException: pass
+    await interaction.response.send_message(f"✅ У {user.mention} снято {removed} выговор(ов). Осталось: {after}/{MAX_REPRIMANDS}.", ephemeral=True)
+
+
 # ============================================================
 # СОБЫТИЕ READY
 # ============================================================
@@ -2215,12 +2659,15 @@ async def on_ready():
     global data_loaded
 
     print("=" * 60)
+
     print(
         f"✅ Бот подключён: {bot.user}"
     )
+
     print(
         f"🆔 ID: {bot.user.id}"
     )
+
     print(
         f"🌐 Серверов: {len(bot.guilds)}"
     )
@@ -2245,7 +2692,7 @@ async def on_ready():
         status=discord.Status.online,
         activity=discord.Activity(
             type=discord.ActivityType.watching,
-            name="за отчётами мафии"
+            name="Не забудь отправить отчет, Академка!"
         )
     )
 
@@ -2263,6 +2710,7 @@ async def on_ready():
 
 if __name__ == "__main__":
     print("🚀 Запуск бота...")
+
     print(
         f"🔑 Токен найден: {bool(TOKEN)}"
     )
